@@ -37,6 +37,20 @@ export type AppSocket = Socket<
 export function createSocketServer(httpServer: HttpServer): IoServer {
   const io: IoServer = new Server(httpServer, {
     cors: { origin: env.corsOrigins, methods: ['GET', 'POST'], credentials: true },
+    // WebSocket only — no HTTP long-polling fallback.
+    //
+    // Polling is a *sequence* of requests, and it only works if every one of them lands
+    // on the same process. Railway has no sticky sessions, so the moment a deploy (or a
+    // second replica) puts two processes behind one hostname, a polling handshake that
+    // switches instances mid-sequence gets a 400 and the client never connects. The
+    // fallback exists for networks that block WebSockets — the same networks that can't
+    // hold the WebRTC call this app is built around, so there is nothing here for those
+    // clients to fall back *to*.
+    //
+    // The client sets the matching option (`momoto-fe/src/utils/socket.ts`). Both sides
+    // must agree: a client that still offers polling first would just fail its first
+    // attempt and retry over WebSocket.
+    transports: ['websocket'],
     // Hard byte cap on any single inbound message (Phase 5). This is a
     // signaling/sync server — no payload is large; strip design is relayed as
     // compact JSON. Per-field caps live in `validate.ts`; this stops oversized
