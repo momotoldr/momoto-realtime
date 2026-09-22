@@ -47,6 +47,12 @@ export type JoinResult =
       replaced?: string
     }
 
+export interface RoomStatus {
+  status: 'open' | 'full' | 'ended' | 'not_found'
+  capacity: number | null
+  members: number
+}
+
 /** How long a minted-but-unjoined room code stays reserved before GC. */
 const RESERVATION_TTL_MS = 60_000
 
@@ -79,15 +85,18 @@ function socketIds(room: RoomState): string[] {
 }
 
 /**
- * In-memory registry of active rooms plus the set of ended room codes. Single
- * source of truth for membership/host; Socket.io's own rooms are kept in sync by
- * the handlers for broadcasting. (A Redis-backed variant is the Phase 5 scale path.)
+ * The room registry: single source of truth for membership, host order and the session
+ * window. Socket.io's own rooms are kept in sync by the handlers, for broadcasting.
+ *
+ * **This interface is the specification, not a type.** Two implementations answer to
+ * it — `MemoryRoomStore` below, and the Redis-backed one that lets room state outlive
+ * the process — and the rules written on each method are what both of them must do.
+ * Where a rule looks arbitrary it is load-bearing; the reasoning is in the comment.
+ *
+ * Every method is async because the Redis implementation cannot be anything else. The
+ * in-memory one answers immediately and simply satisfies the shape.
  */
-class RoomStore {
-  private readonly rooms = new Map<string, RoomState>()
-  /** Ended room code → the instant it ended, so old entries can be swept (Phase 5). */
-  private readonly endedRooms = new Map<string, number>()
-
+export interface RoomStore {
   /**
    * Mint a fresh code guaranteed to be neither an active nor an ended room, and
    * reserve it briefly so it stays authoritative until the creator joins.
@@ -97,24 +106,10 @@ class RoomStore {
    * client that asked for four seats and silently got two would open a group booth in
    * a room whose third person is refused at the join.
    */
-  createRoom(capacity: number = env.roomCapacityDefault): string {
-    let code = generateRoomCode()
-    while (this.rooms.has(code) || this.endedRooms.has(code)) {
-      code = generateRoomCode()
-    }
-    this.rooms.set(code, {
-      members: [],
-      capacity: Math.min(Math.max(Math.trunc(capacity), 2), env.roomCapacityMax),
-      createdAt: Date.now(),
-      reservedUntil: Date.now() + RESERVATION_TTL_MS,
-      endsAt: null,
-    })
-    return code
-  }
+  createRoom(capacity?: number): Promise<string>
 
-  isEnded(roomId: string): boolean {
-    return this.endedRooms.has(roomId)
-  }
+  /** Whether this code has been retired. A retired code must never reopen. */
+  isEnded(roomId: string): Promise<boolean>
 
   /**
    * Joinability of a code, for a pre-join check (`GET /rooms/:id`). Mirrors the
@@ -128,29 +123,13 @@ class RoomStore {
    * with no live room behind it. `members` is the current occupancy — no more than
    * `full`/`open` already tells a caller with the capacity in hand.
    */
-  getStatus(roomId: string): {
-    status: 'open' | 'full' | 'ended' | 'not_found'
-    capacity: number | null
-    members: number
-  } {
-    if (this.endedRooms.has(roomId)) return { status: 'ended', capacity: null, members: 0 }
-    const room = this.rooms.get(roomId)
-    if (!room) return { status: 'not_found', capacity: null, members: 0 }
-    const shape = { capacity: room.capacity, members: room.members.length }
-    if (room.members.length >= room.capacity) return { status: 'full', ...shape }
-    return { status: 'open', ...shape }
-  }
+  getStatus(roomId: string): Promise<RoomStatus>
 
   /** This room's seat count, or `null` if there's no live room on that code. */
-  getCapacity(roomId: string): number | null {
-    return this.rooms.get(roomId)?.capacity ?? null
-  }
+  getCapacity(roomId: string): Promise<number | null>
 
   /** The room's socket ids in join order (`[0]` is the host), or `[]` if unknown. */
-  getMembers(roomId: string): string[] {
-    const room = this.rooms.get(roomId)
-    return room ? socketIds(room) : []
-  }
+  getMembers(roomId: string): Promise<string[]>
 
   /**
    * Attempt to add a socket to a room.
@@ -168,41 +147,16 @@ class RoomStore {
    * looked: the id lived in sessionStorage, which a browser copies into a duplicated
    * tab, so two live tabs could share one id and evict each other. That hazard is gone
    * — the frontend now mints the id per page load and never stores it (see
-   * `momoto/src/utils/socket.ts`), so one id means one live connection. Keeping the
+   * `momoto-fe/src/utils/socket.ts`), so one id means one live connection. Keeping the
    * gate would break rooms that seat more than two: a member reconnecting into a
    * 3-of-4 room is not refused, so they would take a *fresh* seat beside their own
    * dead socket — the room shows a frozen tile, the seat count is wrong, and if they
    * were the host they silently stop being it.
+   *
+   * Concurrency is the implementation's problem, not the caller's: two sockets racing
+   * for the last seat must produce exactly one `joined` and one `full`.
    */
-  join(roomId: string, socketId: string, clientId: string | null = null): JoinResult {
-    if (this.endedRooms.has(roomId)) return { status: 'ended' }
-
-    const room = this.rooms.get(roomId)
-    // A room only exists once minted via `POST /rooms` (or briefly re-reserved after
-    // being emptied — see `leave`). An unknown code is a typo or a hand-typed URL like
-    // `/room/adad`; refuse it rather than silently spawning a lonely one-member room.
-    if (!room) return { status: 'not_found' }
-
-    // Already in this room under this client id — that seat is still theirs.
-    const returning = clientId ? room.members.find((m) => m.clientId === clientId) : undefined
-    if (returning) {
-      room.reservedUntil = null
-      // The *same live socket* re-joining (a duplicate `room:join`, which the client
-      // sends on every reconnect and the server can also see replayed). Nothing was
-      // superseded, and reporting one would be worse than a no-op: the caller
-      // disconnects whatever `replaced` names, which here is this very socket.
-      if (returning.socketId === socketId) return { status: 'joined', members: socketIds(room) }
-      const replaced = returning.socketId
-      returning.socketId = socketId
-      return { status: 'joined', members: socketIds(room), replaced }
-    }
-
-    if (room.members.length >= room.capacity) return { status: 'full' }
-
-    room.members.push({ socketId, clientId })
-    room.reservedUntil = null
-    return { status: 'joined', members: socketIds(room) }
-  }
+  join(roomId: string, socketId: string, clientId?: string | null): Promise<JoinResult>
 
   /**
    * Remove a socket from its room. Returns the remaining members, or `null` if the
@@ -210,24 +164,7 @@ class RoomStore {
    * itself: once a reconnect has taken over its slot (see `join`), its late
    * disconnect must not be mistaken for the member leaving.
    */
-  leave(roomId: string, socketId: string): { members: string[] } | null {
-    const room = this.rooms.get(roomId)
-    if (!room) return null
-    const before = room.members.length
-    room.members = room.members.filter((m) => m.socketId !== socketId)
-    if (room.members.length === before) return null
-    if (room.members.length === 0) {
-      // An active session window keeps the room alive so a rejoin before expiry
-      // resumes the remaining time; its expiry timer will retire it. A pre-window
-      // lobby that empties (e.g. the host refreshed before the guest arrived) is kept
-      // briefly *reserved* so an immediate rejoin resumes the same code — the sweeper
-      // GCs it if it stays abandoned. This is what lets a host refresh survive now
-      // that `join` no longer auto-creates unknown codes.
-      if (room.endsAt === null) room.reservedUntil = Date.now() + RESERVATION_TTL_MS
-      return { members: [] }
-    }
-    return { members: socketIds(room) }
-  }
+  leave(roomId: string, socketId: string): Promise<{ members: string[] } | null>
 
   /**
    * Start the session window if enough members are present and none is running yet.
@@ -241,83 +178,215 @@ class RoomStore {
    * still the caller's policy — a 2-seat room starts automatically when it fills, a
    * larger one waits for the host to say so (see `sessionManager`).
    */
-  startWindow(roomId: string, durationMs: number): number | null {
-    const room = this.rooms.get(roomId)
-    if (!room || room.endsAt !== null) return null
-    if (room.members.length < minSessionMembers(room.capacity)) return null
-    room.endsAt = Date.now() + durationMs
-    return room.endsAt
-  }
+  startWindow(roomId: string, durationMs: number): Promise<number | null>
 
   /** The room's active window end (server ms), or `null` if none/unknown. */
-  getWindow(roomId: string): number | null {
-    return this.rooms.get(roomId)?.endsAt ?? null
-  }
+  getWindow(roomId: string): Promise<number | null>
 
   /** Retire a room: mark its code dead (timestamped) and drop its live state. */
-  endSession(roomId: string): void {
-    this.endedRooms.set(roomId, Date.now())
-    this.rooms.delete(roomId)
-  }
+  endSession(roomId: string): Promise<void>
 
-  /** GC minted-but-unjoined reservations whose TTL has elapsed. */
-  sweepReservations(now: number = Date.now()): number {
-    let removed = 0
-    for (const [code, room] of this.rooms) {
-      if (room.members.length === 0 && room.reservedUntil !== null && room.reservedUntil <= now) {
-        this.rooms.delete(code)
-        removed += 1
-      }
-    }
-    return removed
-  }
-
-  /** GC ended-room codes past their TTL, freeing them to be minted again (Phase 5). */
-  sweepEndedRooms(now: number = Date.now()): number {
-    let removed = 0
-    for (const [code, endedAt] of this.endedRooms) {
-      if (endedAt + ENDED_TTL_MS <= now) {
-        this.endedRooms.delete(code)
-        removed += 1
-      }
-    }
-    return removed
-  }
+  /**
+   * Periodic maintenance, called from the server's sweeper. What it reclaims is the
+   * implementation's business — expired reservations and ended codes here, orphaned
+   * index entries and seats belonging to dead processes in the Redis one — but it must
+   * be safe to call on a schedule and must never throw at the caller.
+   */
+  sweep(now?: number): Promise<void>
 
   /**
    * Live rooms right now, including codes minted but not yet joined — a reservation
    * holds memory the same as an occupied room, and counting only occupied ones would
    * let a flood of unjoined codes past the cap that exists to bound exactly that.
    */
-  activeCount(): number {
-    return this.rooms.size
-  }
+  activeCount(): Promise<number>
 
   /**
-   * Rooms with somebody actually in them — what the public counter on the landing page
-   * calls a live session. Deliberately *not* `activeCount`: that one counts minted-
-   * but-unjoined reservations too, because it guards memory, and showing a visitor a
-   * number inflated by codes nobody opened would be a lie in the other direction.
+   * Rooms with somebody actually in them — what a "live session" means to a person.
+   * Deliberately *not* `activeCount`: that one counts minted-but-unjoined reservations
+   * too, because it guards memory, and a visitor-facing number inflated by codes nobody
+   * opened would be a lie in the other direction.
    *
    * Solo booths never reach the server (they keep a local code and stay offline), so
    * they are invisible here — this counts shared sessions only.
    */
-  occupiedCount(): number {
+  occupiedCount(): Promise<number>
+
+  /** True when a new room would exceed `ROOMS_MAX_ACTIVE`. Joins are never gated. */
+  atCapacity(): Promise<boolean>
+}
+
+/**
+ * Rooms held in this process's memory.
+ *
+ * Correct for a single instance, and the reason a deploy currently ends every live
+ * room: this state dies with the process. It stays as the local-development store
+ * (selected when `REDIS_URL` is unset) and as the reference implementation of the
+ * rules above — **not** as a runtime fallback. Falling back to it while Redis is down
+ * would leave two instances holding different truths about the same room, which is
+ * worse than being unavailable.
+ */
+export class MemoryRoomStore implements RoomStore {
+  private readonly rooms = new Map<string, RoomState>()
+  /** Ended room code → the instant it ended, so old entries can be swept. */
+  private readonly endedRooms = new Map<string, number>()
+
+  createRoom(capacity: number = env.roomCapacityDefault): Promise<string> {
+    let code = generateRoomCode()
+    while (this.rooms.has(code) || this.endedRooms.has(code)) {
+      code = generateRoomCode()
+    }
+    this.rooms.set(code, {
+      members: [],
+      capacity: Math.min(Math.max(Math.trunc(capacity), 2), env.roomCapacityMax),
+      createdAt: Date.now(),
+      reservedUntil: Date.now() + RESERVATION_TTL_MS,
+      endsAt: null,
+    })
+    return Promise.resolve(code)
+  }
+
+  isEnded(roomId: string): Promise<boolean> {
+    return Promise.resolve(this.endedRooms.has(roomId))
+  }
+
+  getStatus(roomId: string): Promise<RoomStatus> {
+    if (this.endedRooms.has(roomId)) {
+      return Promise.resolve({ status: 'ended', capacity: null, members: 0 })
+    }
+    const room = this.rooms.get(roomId)
+    if (!room) return Promise.resolve({ status: 'not_found', capacity: null, members: 0 })
+    const shape = { capacity: room.capacity, members: room.members.length }
+    if (room.members.length >= room.capacity) {
+      return Promise.resolve({ status: 'full', ...shape })
+    }
+    return Promise.resolve({ status: 'open', ...shape })
+  }
+
+  getCapacity(roomId: string): Promise<number | null> {
+    return Promise.resolve(this.rooms.get(roomId)?.capacity ?? null)
+  }
+
+  getMembers(roomId: string): Promise<string[]> {
+    const room = this.rooms.get(roomId)
+    return Promise.resolve(room ? socketIds(room) : [])
+  }
+
+  join(roomId: string, socketId: string, clientId: string | null = null): Promise<JoinResult> {
+    if (this.endedRooms.has(roomId)) return Promise.resolve({ status: 'ended' })
+
+    const room = this.rooms.get(roomId)
+    // A room only exists once minted via `POST /rooms` (or briefly re-reserved after
+    // being emptied — see `leave`). An unknown code is a typo or a hand-typed URL like
+    // `/room/adad`; refuse it rather than silently spawning a lonely one-member room.
+    if (!room) return Promise.resolve({ status: 'not_found' })
+
+    // Already in this room under this client id — that seat is still theirs.
+    const returning = clientId ? room.members.find((m) => m.clientId === clientId) : undefined
+    if (returning) {
+      room.reservedUntil = null
+      // The *same live socket* re-joining (a duplicate `room:join`, which the client
+      // sends on every reconnect and the server can also see replayed). Nothing was
+      // superseded, and reporting one would be worse than a no-op: the caller
+      // disconnects whatever `replaced` names, which here is this very socket.
+      if (returning.socketId === socketId) {
+        return Promise.resolve({ status: 'joined', members: socketIds(room) })
+      }
+      const replaced = returning.socketId
+      returning.socketId = socketId
+      return Promise.resolve({ status: 'joined', members: socketIds(room), replaced })
+    }
+
+    if (room.members.length >= room.capacity) return Promise.resolve({ status: 'full' })
+
+    room.members.push({ socketId, clientId })
+    room.reservedUntil = null
+    return Promise.resolve({ status: 'joined', members: socketIds(room) })
+  }
+
+  leave(roomId: string, socketId: string): Promise<{ members: string[] } | null> {
+    const room = this.rooms.get(roomId)
+    if (!room) return Promise.resolve(null)
+    const before = room.members.length
+    room.members = room.members.filter((m) => m.socketId !== socketId)
+    if (room.members.length === before) return Promise.resolve(null)
+    if (room.members.length === 0) {
+      // An active session window keeps the room alive so a rejoin before expiry
+      // resumes the remaining time; its expiry timer will retire it. A pre-window
+      // lobby that empties (e.g. the host refreshed before the guest arrived) is kept
+      // briefly *reserved* so an immediate rejoin resumes the same code — the sweeper
+      // GCs it if it stays abandoned. This is what lets a host refresh survive now
+      // that `join` no longer auto-creates unknown codes.
+      if (room.endsAt === null) room.reservedUntil = Date.now() + RESERVATION_TTL_MS
+      return Promise.resolve({ members: [] })
+    }
+    return Promise.resolve({ members: socketIds(room) })
+  }
+
+  startWindow(roomId: string, durationMs: number): Promise<number | null> {
+    const room = this.rooms.get(roomId)
+    if (!room || room.endsAt !== null) return Promise.resolve(null)
+    if (room.members.length < minSessionMembers(room.capacity)) return Promise.resolve(null)
+    room.endsAt = Date.now() + durationMs
+    return Promise.resolve(room.endsAt)
+  }
+
+  getWindow(roomId: string): Promise<number | null> {
+    return Promise.resolve(this.rooms.get(roomId)?.endsAt ?? null)
+  }
+
+  endSession(roomId: string): Promise<void> {
+    this.endedRooms.set(roomId, Date.now())
+    this.rooms.delete(roomId)
+    return Promise.resolve()
+  }
+
+  /**
+   * Reclaim minted-but-unjoined reservations and ended codes past their TTL.
+   *
+   * Both maps would otherwise grow without bound. The Redis store needs neither pass —
+   * key TTLs do this work there — which is why the interface exposes one `sweep` rather
+   * than the two specific ones this class happens to need.
+   */
+  sweep(now: number = Date.now()): Promise<void> {
+    for (const [code, room] of this.rooms) {
+      if (room.members.length === 0 && room.reservedUntil !== null && room.reservedUntil <= now) {
+        this.rooms.delete(code)
+      }
+    }
+    for (const [code, endedAt] of this.endedRooms) {
+      if (endedAt + ENDED_TTL_MS <= now) this.endedRooms.delete(code)
+    }
+    return Promise.resolve()
+  }
+
+  activeCount(): Promise<number> {
+    return Promise.resolve(this.rooms.size)
+  }
+
+  occupiedCount(): Promise<number> {
     let total = 0
     for (const room of this.rooms.values()) {
       if (room.members.length > 0) total += 1
     }
-    return total
+    return Promise.resolve(total)
   }
 
-  /** True when a new room would exceed `ROOMS_MAX_ACTIVE`. Joins are never gated. */
-  atCapacity(): boolean {
-    return this.rooms.size >= env.roomsMaxActive
-  }
-
-  stats(): { rooms: number; ended: number } {
-    return { rooms: this.rooms.size, ended: this.endedRooms.size }
+  atCapacity(): Promise<boolean> {
+    return Promise.resolve(this.rooms.size >= env.roomsMaxActive)
   }
 }
 
-export const roomStore = new RoomStore()
+/**
+ * The store this process uses.
+ *
+ * Deliberately unconditional for now: the Redis implementation doesn't exist yet, so
+ * selecting on `REDIS_URL` here would pick a store that isn't written. When it lands,
+ * this is the one line that chooses — and `redis.ts`'s `selectedRoomStore()` already
+ * reports what the config *intends*, which is how `check:redis` can point out the gap
+ * in the meantime.
+ */
+export const roomStore: RoomStore = new MemoryRoomStore()
+
+/** What the process actually runs, as opposed to what the config asks for. */
+export const roomStoreKind: 'memory' | 'redis' = 'memory'

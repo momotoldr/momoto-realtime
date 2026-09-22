@@ -23,6 +23,7 @@ import { Server } from 'socket.io'
 
 import { env } from '../src/config/env.js'
 import { closeRedis, getRedis, redisEnabled, selectedRoomStore } from '../src/lib/redis.js'
+import { roomStoreKind } from '../src/rooms/roomStore.js'
 
 const GREEN = '\x1b[32m'
 const RED = '\x1b[31m'
@@ -77,7 +78,7 @@ async function main(): Promise<number> {
 
   if (!redisEnabled) {
     warn('REDIS_URL is not set.')
-    hint(`Room state would use the in-memory store (selected: ${selectedRoomStore()}).`)
+    hint(`Room state uses the in-memory store (selected: ${selectedRoomStore()}).`)
     hint('That is correct for local development — a single process, no deploy safety.')
     hint('In production it means every deploy still ends every live room.')
     console.log('')
@@ -86,6 +87,13 @@ async function main(): Promise<number> {
 
   ok(`REDIS_URL → ${safeTarget(env.redisUrl as string)}`)
   hint(`Room store this config selects: ${selectedRoomStore()}`)
+  if (selectedRoomStore() !== roomStoreKind) {
+    // Expected while the Redis store is still being built: the config asks for Redis,
+    // the process still runs the in-memory one. Said out loud so nobody reads a green
+    // check below as "rooms survive a deploy now".
+    warn(`Room store actually running: ${roomStoreKind} — the Redis store is not wired yet.`)
+    hint('Everything below tests Redis itself, not the room state path.')
+  }
 
   const redis = getRedis()
 

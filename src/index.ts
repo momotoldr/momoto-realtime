@@ -18,22 +18,24 @@ const app = createApp()
 const httpServer = createServer(app)
 createSocketServer(httpServer)
 
-// Periodic GC: reclaim unjoined reservations, expired ended-room codes, and elapsed
-// rate-limit windows so no in-memory map grows unbounded. `unref` so the timer never
-// blocks shutdown.
-const sweeper = setInterval(() => {
-  // A throw inside a timer callback has no caller to catch it — it would surface as
-  // an uncaught exception and end the process. Contain it here.
+// Periodic GC: reclaim whatever the room store no longer needs (unjoined reservations
+// and expired ended-room codes in memory; orphaned index entries once it is Redis) plus
+// elapsed rate-limit windows, so nothing grows unbounded.
+async function sweep(): Promise<void> {
+  // A throw — or now a rejection — inside a timer callback has no caller to catch it,
+  // and would surface as an uncaught exception and end the process. Contain it here.
   try {
-    roomStore.sweepReservations()
-    roomStore.sweepEndedRooms()
+    await roomStore.sweep()
     sweepSocketLimits()
     sweepRoomCreateLimits()
     sweepTurnLimits()
   } catch (err) {
     logger.error('sweep.failed', { err: String(err) })
   }
-}, 30_000)
+}
+
+// `unref` so the timer never blocks shutdown.
+const sweeper = setInterval(() => void sweep(), 30_000)
 sweeper.unref()
 
 // Open the Redis connection at boot when one is configured. Nothing reads it yet — the

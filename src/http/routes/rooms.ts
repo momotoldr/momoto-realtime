@@ -43,7 +43,7 @@ export function sweepRoomCreateLimits(now: number = Date.now()): number {
  * it immediately, to the person who pressed the button. This is also what a frontend
  * with group mode enabled meets when the server has not raised `ROOM_CAPACITY_MAX`.
  */
-roomsRouter.post('/', (req, res) => {
+roomsRouter.post('/', async (req, res, next) => {
   const key = req.ip ?? 'unknown'
   if (!createLimiter.allow(key)) {
     logger.warn('room.create.ratelimited', { ip: req.ip })
@@ -64,20 +64,28 @@ roomsRouter.post('/', (req, res) => {
     return
   }
 
-  // Checked after validation and before minting: a refused request must not consume a
-  // code, and the sweeper runs on its own schedule, so a caller that retries in a minute
-  // may well get in. 503 rather than 429 — nothing is wrong with *this* client's rate,
-  // the booth is simply full, and `Retry-After` says so in the way a proxy understands.
-  if (roomStore.atCapacity()) {
-    logger.warn('room.create.atCapacity', { active: roomStore.activeCount() })
-    res.setHeader('Retry-After', '60')
-    res.status(503).json({ error: 'booth_busy' })
-    return
-  }
+  // Everything past here touches the room store, which can fail once that store is
+  // Redis. Express 4 does not catch a rejected promise from an async handler — it would
+  // hang the request and surface as an unhandled rejection — so the failure is handed
+  // to `next` and answered by `errorHandler` as the 500 it is.
+  try {
+    // Checked after validation and before minting: a refused request must not consume a
+    // code, and the sweeper runs on its own schedule, so a caller that retries in a minute
+    // may well get in. 503 rather than 429 — nothing is wrong with *this* client's rate,
+    // the booth is simply full, and `Retry-After` says so in the way a proxy understands.
+    if (await roomStore.atCapacity()) {
+      logger.warn('room.create.atCapacity', { active: await roomStore.activeCount() })
+      res.setHeader('Retry-After', '60')
+      res.status(503).json({ error: 'booth_busy' })
+      return
+    }
 
-  const roomId = roomStore.createRoom(requested)
-  logger.info('room.created', { roomId, capacity: requested ?? env.roomCapacityDefault })
-  res.status(201).json({ roomId })
+    const roomId = await roomStore.createRoom(requested)
+    logger.info('room.created', { roomId, capacity: requested ?? env.roomCapacityDefault })
+    res.status(201).json({ roomId })
+  } catch (err) {
+    next(err)
+  }
 })
 
 /**
@@ -90,12 +98,16 @@ roomsRouter.post('/', (req, res) => {
  * The joiner needs the seat count *before* entering to open the booth in the right
  * mode; `status` alone is unchanged, so an older client reading only that keeps working.
  */
-roomsRouter.get('/:id', (req, res) => {
+roomsRouter.get('/:id', async (req, res, next) => {
   const key = req.ip ?? 'unknown'
   if (!lookupLimiter.allow(key)) {
     logger.warn('room.lookup.ratelimited', { ip: req.ip })
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
-  res.json(roomStore.getStatus(req.params.id))
+  try {
+    res.json(await roomStore.getStatus(req.params.id))
+  } catch (err) {
+    next(err)
+  }
 })

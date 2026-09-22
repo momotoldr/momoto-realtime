@@ -26,9 +26,16 @@ function scheduleExpiry(io: IoServer, roomId: string, endsAt: number): void {
       // is distinct from `room:ended` (which is the "joining a dead room" screen); a
       // present member sees the friendly "time's up" screen off its own `ended` flag.
       io.to(roomId).emit(SocketEvents.sessionExpired)
-      roomStore.endSession(roomId)
-      // Retiring the code makes any future join refuse with `room:ended`.
-      logger.info('session.window.expired', { roomId })
+      // Retiring the code makes any future join refuse with `room:ended`. A timer
+      // callback has no caller to catch a rejection, so it is handled here rather than
+      // escaping as an unhandled rejection: the members have already been told the
+      // window is over, and a store that refused the write will be reconciled by the
+      // room's own TTL.
+      void roomStore.endSession(roomId).then(
+        () => logger.info('session.window.expired', { roomId }),
+        (err: unknown) =>
+          logger.error('session.window.expire_failed', { roomId, err: String(err) }),
+      )
     },
     Math.max(0, endsAt - Date.now()),
   )
@@ -37,8 +44,8 @@ function scheduleExpiry(io: IoServer, roomId: string, endsAt: number): void {
 }
 
 /** Start the window, tell the room, and arm its expiry. Callers have done the policy. */
-function openWindowNow(io: IoServer, roomId: string, trigger: string): boolean {
-  const endsAt = roomStore.startWindow(roomId, env.sessionDurationMs)
+async function openWindowNow(io: IoServer, roomId: string, trigger: string): Promise<boolean> {
+  const endsAt = await roomStore.startWindow(roomId, env.sessionDurationMs)
   if (endsAt === null) return false
   io.to(roomId).emit(SocketEvents.sessionWindow, { endsAt })
   scheduleExpiry(io, roomId, endsAt)
@@ -57,21 +64,21 @@ function openWindowNow(io: IoServer, roomId: string, trigger: string): boolean {
  * would burn the window while people are still arriving. Those rooms wait for the host
  * to say so — `session:open`, below.
  */
-export function handleWindowOnJoin(
+export async function handleWindowOnJoin(
   io: IoServer,
   socket: AppSocket,
   roomId: string,
   memberCount: number,
-): void {
-  const existing = roomStore.getWindow(roomId)
+): Promise<void> {
+  const existing = await roomStore.getWindow(roomId)
   if (existing !== null) {
     socket.emit(SocketEvents.sessionWindow, { endsAt: existing }) // resume
     return
   }
-  if (roomStore.getCapacity(roomId) !== 2) return
+  if ((await roomStore.getCapacity(roomId)) !== 2) return
   if (memberCount < 2) return
 
-  openWindowNow(io, roomId, 'capacity')
+  await openWindowNow(io, roomId, 'capacity')
 }
 
 /**
@@ -85,13 +92,17 @@ export function handleWindowOnJoin(
  * check costs nothing and stops a stray client burning the group's five minutes before
  * everyone has arrived.
  */
-export function openWindow(io: IoServer, socket: AppSocket, roomId: string): string | null {
-  if (roomStore.getWindow(roomId) !== null) return 'already_open'
-  const members = roomStore.getMembers(roomId)
+export async function openWindow(
+  io: IoServer,
+  socket: AppSocket,
+  roomId: string,
+): Promise<string | null> {
+  if ((await roomStore.getWindow(roomId)) !== null) return 'already_open'
+  const members = await roomStore.getMembers(roomId)
   if (members[0] !== socket.id) return 'not_host'
-  const capacity = roomStore.getCapacity(roomId) ?? members.length
+  const capacity = (await roomStore.getCapacity(roomId)) ?? members.length
   if (members.length < minSessionMembers(capacity)) return 'not_enough_members'
-  return openWindowNow(io, roomId, 'host') ? null : 'refused'
+  return (await openWindowNow(io, roomId, 'host')) ? null : 'refused'
 }
 
 /**
@@ -99,9 +110,9 @@ export function openWindow(io: IoServer, socket: AppSocket, roomId: string): str
  * notify the other member so it drops to the "room closed" screen. Kept for contract
  * parity — the server-owned window is normally what ends a session.
  */
-export function endRoom(socket: AppSocket, roomId: string): void {
+export async function endRoom(socket: AppSocket, roomId: string): Promise<void> {
   clearTimer(roomId)
-  roomStore.endSession(roomId)
+  await roomStore.endSession(roomId)
   socket.to(roomId).emit(SocketEvents.roomEnded)
   logger.info('session.end', { roomId })
 }

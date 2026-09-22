@@ -1,6 +1,7 @@
 import { logger } from '../../lib/logger.js'
 import { roomStore } from '../../rooms/roomStore.js'
 import { SocketEvents } from '../../types/events.js'
+import { runSocketOp } from '../guard.js'
 import type { AppSocket } from '../server.js'
 import { announceLimiter, limitKey, shotsLimiter } from '../rateLimits.js'
 import { isPeerAnnounce, isPeerMediaState, isStripConfig, isStripShots } from '../validate.js'
@@ -20,10 +21,10 @@ function toPeer(socket: AppSocket) {
  * camera to a stranger. The frontend refuses ids it didn't learn through the room too;
  * this is the half that doesn't depend on every client being well-behaved.
  */
-function toMember(socket: AppSocket, target: string) {
+async function toMember(socket: AppSocket, target: string) {
   const roomId = socket.data.roomId
   if (!roomId) return null
-  if (!roomStore.getMembers(roomId).includes(target)) {
+  if (!(await roomStore.getMembers(roomId)).includes(target)) {
     logger.warn('relay.directed.outsider', { socketId: socket.id, roomId, target })
     return null
   }
@@ -66,8 +67,18 @@ export function registerRelayHandlers(socket: AppSocket): void {
       // a forged `reply` can do is suppress a reply the forger asked for.
       reply: Boolean(payload.reply),
     }
-    const target = payload.to ? toMember(socket, payload.to) : toPeer(socket)
-    target?.emit(SocketEvents.peerAnnounce, out)
+    // The broadcast case needs no store lookup — `socket.to(room)` is membership by
+    // construction. Only a directed announce has to prove the target is in this room,
+    // which is the one path here that can fail, so it is the only one guarded.
+    const to = payload.to
+    if (!to) {
+      toPeer(socket)?.emit(SocketEvents.peerAnnounce, out)
+      return
+    }
+    runSocketOp(SocketEvents.peerAnnounce, socket, async () => {
+      const target = await toMember(socket, to)
+      target?.emit(SocketEvents.peerAnnounce, out)
+    })
   })
 
   socket.on(SocketEvents.peerMediaState, (payload) => {
