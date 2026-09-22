@@ -9,6 +9,7 @@ import { createApp } from './http/app.js'
 import { sweepRoomCreateLimits } from './http/routes/rooms.js'
 import { sweepTurnLimits } from './http/routes/turn.js'
 import { logger } from './lib/logger.js'
+import { getRedis, redisEnabled } from './lib/redis.js'
 import { roomStore } from './rooms/roomStore.js'
 import { sweepSocketLimits } from './socket/rateLimits.js'
 import { createSocketServer } from './socket/server.js'
@@ -35,11 +36,31 @@ const sweeper = setInterval(() => {
 }, 30_000)
 sweeper.unref()
 
+// Open the Redis connection at boot when one is configured. Nothing reads it yet — the
+// room store still lives in this process's memory — but connecting here is what turns a
+// misconfiguration into a log line on deploy rather than a mystery during the first live
+// session. It is also the hook `/healthz` will use once the drain lands: a deployment
+// that has never reached Redis must not go Active.
+//
+// The IPv6 question is the one worth proving on staging: Railway's private network only
+// resolves over IPv6, so `redis.ready` appearing in these logs is the evidence that
+// `family: 0` does its job for `redis.railway.internal`.
+if (redisEnabled) {
+  getRedis()
+} else if (process.env.NODE_ENV === 'production') {
+  // Not fatal: one instance with in-memory rooms is a working server, just one where
+  // every deploy still ends every live room. Loud, because that is rarely intended.
+  logger.warn('redis.not_configured', {
+    detail: 'REDIS_URL is unset in production — room state is in-process and dies with a deploy',
+  })
+}
+
 httpServer.listen(env.port, () => {
   logger.info('server.listening', {
     port: env.port,
     corsOrigins: env.corsOrigins,
     roomCapacityMax: env.roomCapacityMax,
+    redis: redisEnabled ? 'configured' : 'off',
     turn: env.cloudflareTurnKeyId ? 'cloudflare' : env.turnUrls.length > 0 ? 'coturn' : 'stun-only',
   })
 })
