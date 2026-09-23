@@ -1,5 +1,6 @@
+import { isDraining } from '../../lifecycle.js'
 import { logger } from '../../lib/logger.js'
-import { roomStore } from '../../rooms/roomStore.js'
+import { roomStore } from '../../rooms/store.js'
 import { endRoom, handleWindowOnJoin, openWindow } from '../../rooms/sessionManager.js'
 import { SocketEvents } from '../../types/events.js'
 import { runSocketOp } from '../guard.js'
@@ -126,6 +127,15 @@ export function registerRoomHandlers(io: IoServer, socket: AppSocket): void {
   socket.on('disconnect', () => {
     const roomId = socket.data.roomId
     if (!roomId) return
+    // A drain is not a leave. This process is closing its sockets because it is being
+    // replaced, and every one of these clients is about to reconnect to the new
+    // instance and reclaim its seat. Running `leave` here would drop them from the room
+    // and tell their friend they left, a second before they reappear — so the seats
+    // stay, and the sweeper frees the ones nobody comes back for.
+    if (isDraining()) {
+      logger.info('room.leave.draining', { socketId: socket.id, roomId })
+      return
+    }
     runSocketOp('disconnect', socket, () => leaveRoom(io, socket, roomId))
   })
 }

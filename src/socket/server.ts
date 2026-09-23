@@ -1,10 +1,12 @@
 import type { Server as HttpServer } from 'node:http'
 
+import { createAdapter } from '@socket.io/redis-streams-adapter'
 import { Server, type Socket } from 'socket.io'
 
 import { verifyAccessToken } from '../auth/verifyAccessToken.js'
 import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
+import { getRedis, redisEnabled } from '../lib/redis.js'
 import { registerRelayHandlers } from './handlers/relayHandlers.js'
 import { registerRoomHandlers } from './handlers/roomHandlers.js'
 import { registerSyncHandlers } from './handlers/syncHandlers.js'
@@ -56,6 +58,19 @@ export function createSocketServer(httpServer: HttpServer): IoServer {
     // compact JSON. Per-field caps live in `validate.ts`; this stops oversized
     // frames before they're even parsed. Default is 1MB; 128KB is ample here.
     maxHttpBufferSize: 128 * 1024,
+    // Broadcast across processes when there is somewhere to broadcast through.
+    //
+    // The **Streams** adapter, not the pub/sub one: it resumes the stream after a brief
+    // Redis disconnect without losing packets, where pub/sub would silently deliver only
+    // to local clients while severed — and "your friend's countdown never arrived" is
+    // exactly the bug this whole change exists to prevent. It also duplicates its own
+    // connections internally for the blocking reads, so handing it the shared client
+    // does not stall an app command.
+    //
+    // Without it the server is correct but alone: during a deploy the host can sit on
+    // the old instance and the guest on the new one, and nothing either says would reach
+    // the other.
+    ...(redisEnabled ? { adapter: createAdapter(getRedis()) } : {}),
   })
 
   // Handshake auth is optional: rooms are open so a guest can try the booth before

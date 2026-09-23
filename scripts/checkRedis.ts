@@ -23,7 +23,7 @@ import { Server } from 'socket.io'
 
 import { env } from '../src/config/env.js'
 import { closeRedis, getRedis, redisEnabled, selectedRoomStore } from '../src/lib/redis.js'
-import { roomStoreKind } from '../src/rooms/roomStore.js'
+import { roomStoreKind } from '../src/rooms/store.js'
 
 const GREEN = '\x1b[32m'
 const RED = '\x1b[31m'

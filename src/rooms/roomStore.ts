@@ -47,6 +47,19 @@ export type JoinResult =
       replaced?: string
     }
 
+/** A seat freed by the sweeper because the process holding it is gone. */
+export interface ReapedMember {
+  roomId: string
+  socketId: string
+  /** The room's remaining members, for the `room:members` that follows. */
+  members: string[]
+}
+
+export interface SweepResult {
+  /** Seats freed this pass. The caller announces them exactly like a normal leave. */
+  reaped: ReapedMember[]
+}
+
 export interface RoomStatus {
   status: 'open' | 'full' | 'ended' | 'not_found'
   capacity: number | null
@@ -54,7 +67,27 @@ export interface RoomStatus {
 }
 
 /** How long a minted-but-unjoined room code stays reserved before GC. */
-const RESERVATION_TTL_MS = 60_000
+export const RESERVATION_TTL_MS = 60_000
+
+/**
+ * How long a room key outlives its own window in Redis.
+ *
+ * The window ending is not the room ending: `session:expired` still has to be delivered
+ * and the room retired, and a straggler arriving a moment late should meet the closed
+ * screen rather than a code that evaporated. A minute is far more than either needs.
+ */
+export const WINDOW_TTL_GRACE_MS = 60_000
+
+/**
+ * How long a seat is held for a member whose process has died before it is freed.
+ *
+ * The owner is almost always mid-reconnect — measured at well under a second on staging
+ * — and reclaiming their own seat is the normal path. This grace only covers the client
+ * that never comes back at all: the tab closed during a deploy, or a hard crash. Too
+ * short and a slow network costs somebody their seat; too long and their friend stares
+ * at a frozen tile.
+ */
+export const GHOST_GRACE_MS = 30_000
 
 /**
  * Members that must be present before a session window may open, by room size.
@@ -77,7 +110,7 @@ export function minSessionMembers(capacity: number): number {
  * short enough that the set can't grow without bound. After this, the code is free
  * to be minted again.
  */
-const ENDED_TTL_MS = 10 * 60_000
+export const ENDED_TTL_MS = 10 * 60_000
 
 /** The room's socket ids in join order — the shape the wire contract speaks. */
 function socketIds(room: RoomState): string[] {
@@ -187,12 +220,27 @@ export interface RoomStore {
   endSession(roomId: string): Promise<void>
 
   /**
+   * Claim the rooms whose session window has elapsed, and return their codes.
+   *
+   * **Claiming is the point.** The caller announces `session:expired` and retires the
+   * room, and that must happen exactly once even when several processes are polling the
+   * same state — so a room may be returned to one caller only, ever.
+   *
+   * Polling rather than a timer per room is what lets the window survive the process
+   * that opened it: a `setTimeout` in a process that is being replaced never fires, and
+   * the room would run forever. Clients count down locally from `endsAt` and never wait
+   * on this, so a few hundred milliseconds of slack costs nothing — the push only
+   * exists to kick a backgrounded tab.
+   */
+  claimExpired(now?: number, limit?: number): Promise<string[]>
+
+  /**
    * Periodic maintenance, called from the server's sweeper. What it reclaims is the
    * implementation's business — expired reservations and ended codes here, orphaned
    * index entries and seats belonging to dead processes in the Redis one — but it must
    * be safe to call on a schedule and must never throw at the caller.
    */
-  sweep(now?: number): Promise<void>
+  sweep(now?: number): Promise<SweepResult>
 
   /**
    * Live rooms right now, including codes minted but not yet joined — a reservation
@@ -230,6 +278,12 @@ export class MemoryRoomStore implements RoomStore {
   private readonly rooms = new Map<string, RoomState>()
   /** Ended room code → the instant it ended, so old entries can be swept. */
   private readonly endedRooms = new Map<string, number>()
+  /**
+   * Windows already handed to a caller by `claimExpired`. One process, but the poll
+   * interval is shorter than the work that follows a claim, so without this a room
+   * could be claimed twice before the first claim finished retiring it.
+   */
+  private readonly claimedExpiries = new Set<string>()
 
   createRoom(capacity: number = env.roomCapacityDefault): Promise<string> {
     let code = generateRoomCode()
@@ -338,7 +392,20 @@ export class MemoryRoomStore implements RoomStore {
   endSession(roomId: string): Promise<void> {
     this.endedRooms.set(roomId, Date.now())
     this.rooms.delete(roomId)
+    this.claimedExpiries.delete(roomId)
     return Promise.resolve()
+  }
+
+  claimExpired(now: number = Date.now(), limit = 50): Promise<string[]> {
+    const claimed: string[] = []
+    for (const [code, room] of this.rooms) {
+      if (claimed.length >= limit) break
+      if (room.endsAt === null || room.endsAt > now) continue
+      if (this.claimedExpiries.has(code)) continue
+      this.claimedExpiries.add(code)
+      claimed.push(code)
+    }
+    return Promise.resolve(claimed)
   }
 
   /**
@@ -348,7 +415,7 @@ export class MemoryRoomStore implements RoomStore {
    * key TTLs do this work there — which is why the interface exposes one `sweep` rather
    * than the two specific ones this class happens to need.
    */
-  sweep(now: number = Date.now()): Promise<void> {
+  sweep(now: number = Date.now()): Promise<SweepResult> {
     for (const [code, room] of this.rooms) {
       if (room.members.length === 0 && room.reservedUntil !== null && room.reservedUntil <= now) {
         this.rooms.delete(code)
@@ -357,7 +424,9 @@ export class MemoryRoomStore implements RoomStore {
     for (const [code, endedAt] of this.endedRooms) {
       if (endedAt + ENDED_TTL_MS <= now) this.endedRooms.delete(code)
     }
-    return Promise.resolve()
+    // Nothing to reap: a seat here cannot outlive the process that holds it, because
+    // the process *is* the store.
+    return Promise.resolve({ reaped: [] })
   }
 
   activeCount(): Promise<number> {
@@ -376,17 +445,3 @@ export class MemoryRoomStore implements RoomStore {
     return Promise.resolve(this.rooms.size >= env.roomsMaxActive)
   }
 }
-
-/**
- * The store this process uses.
- *
- * Deliberately unconditional for now: the Redis implementation doesn't exist yet, so
- * selecting on `REDIS_URL` here would pick a store that isn't written. When it lands,
- * this is the one line that chooses — and `redis.ts`'s `selectedRoomStore()` already
- * reports what the config *intends*, which is how `check:redis` can point out the gap
- * in the meantime.
- */
-export const roomStore: RoomStore = new MemoryRoomStore()
-
-/** What the process actually runs, as opposed to what the config asks for. */
-export const roomStoreKind: 'memory' | 'redis' = 'memory'

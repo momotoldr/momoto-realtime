@@ -3,6 +3,8 @@ import express, { type Express } from 'express'
 import helmet from 'helmet'
 
 import { env } from '../config/env.js'
+import { isDraining } from '../lifecycle.js'
+import { redisEnabled, redisHasConnected } from '../lib/redis.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { roomsRouter } from './routes/rooms.js'
 import { turnRouter } from './routes/turn.js'
@@ -46,7 +48,29 @@ export function createApp(): Express {
   // Only `POST /rooms { capacity }` has a body here, and it's a single number.
   app.use(express.json({ limit: '1kb' }))
 
+  /**
+   * Readiness, not liveness — the platform routes on this and decides when it is safe
+   * to stop the previous deployment, so it answers for exactly two situations.
+   *
+   * **Draining:** 503 the moment SIGTERM arrives, so nothing new is sent to a process
+   * that is closing its sockets.
+   *
+   * **Redis not yet reached:** 503 until the connection has succeeded *once*, so a
+   * deployment that cannot see Redis never goes Active and never becomes the instance
+   * serving rooms it has nowhere to store. Deliberately asymmetric: after that first
+   * success a Redis blip must **not** flip this, or the platform would restart healthy
+   * instances in a loop for the duration of a hiccup — turning a two-second stall into
+   * an outage of our own making.
+   */
   app.get('/healthz', (_req, res) => {
+    if (isDraining()) {
+      res.status(503).json({ status: 'draining', uptime: process.uptime() })
+      return
+    }
+    if (redisEnabled && !redisHasConnected()) {
+      res.status(503).json({ status: 'starting', detail: 'redis not reached yet' })
+      return
+    }
     res.json({ status: 'ok', uptime: process.uptime() })
   })
 

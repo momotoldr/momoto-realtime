@@ -3,7 +3,7 @@ import { Router } from 'express'
 import { env } from '../../config/env.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
-import { roomStore } from '../../rooms/roomStore.js'
+import { roomStore } from '../../rooms/store.js'
 
 export const roomsRouter = Router()
 

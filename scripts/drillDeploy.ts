@@ -72,6 +72,14 @@ class Participant {
   sawPeerLeft = false
   droppedAt: number | null = null
   reconnectedAt: number | null = null
+  /**
+   * The last window and join payloads, recorded as they arrive.
+   *
+   * Not awaited after the fact: the re-join fires the instant the socket reconnects, so
+   * a listener attached later than that misses it and reports a healthy room as broken.
+   */
+  lastWindow: { endsAt: number } | null = null
+  lastJoined: Joined | null = null
 
   constructor(
     readonly name: string,
@@ -84,6 +92,8 @@ class Participant {
       reconnectionDelay: 500,
       reconnectionDelayMax: 2_000,
     })
+    this.socket.on('session:window', (payload: { endsAt: number }) => (this.lastWindow = payload))
+    this.socket.on('room:joined', (payload: Joined) => (this.lastJoined = payload))
     this.socket.on('room:ended', () => (this.sawEnded = true))
     this.socket.on('room:not-found', () => (this.sawNotFound = true))
     this.socket.on('room:peer-left', () => (this.sawPeerLeft = true))
@@ -200,16 +210,21 @@ async function main(): Promise<number> {
   ok('neither saw their friend leave', !host.sawPeerLeft && !guest.sawPeerLeft)
 
   if (survived) {
-    const resumed = await host.next<{ endsAt: number }>('session:window', 3_000)
     ok(
       'the window resumed with the same endsAt',
-      resumed?.endsAt === before.endsAt,
-      `before=${before.endsAt} after=${resumed?.endsAt ?? 'none'}`,
+      host.lastWindow?.endsAt === before.endsAt,
+      `before=${before.endsAt} after=${host.lastWindow?.endsAt ?? 'none'}`,
     )
-    const rejoined = await host.next<Joined>('room:joined', 3_000)
-    if (rejoined) {
-      ok('host order survived', rejoined.members[0] === rejoined.selfId)
-    }
+    ok(
+      'both were readmitted to the room',
+      host.lastJoined?.members.length === 2 && guest.lastJoined?.members.length === 2,
+      `host sees ${host.lastJoined?.members.length ?? 0}, guest sees ${guest.lastJoined?.members.length ?? 0}`,
+    )
+    ok(
+      'host order survived',
+      host.lastJoined?.members[0] === host.lastJoined?.selfId,
+      'the first member is still the host',
+    )
   }
 
   host.socket.close()

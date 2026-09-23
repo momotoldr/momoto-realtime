@@ -1,5 +1,5 @@
 import { logger } from '../../lib/logger.js'
-import { roomStore } from '../../rooms/roomStore.js'
+import { roomStore } from '../../rooms/store.js'
 import { SocketEvents } from '../../types/events.js'
 import { runSocketOp } from '../guard.js'
 import type { AppSocket } from '../server.js'

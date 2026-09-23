@@ -2,55 +2,71 @@ import { env } from '../config/env.js'
 import { logger } from '../lib/logger.js'
 import type { AppSocket, IoServer } from '../socket/server.js'
 import { SocketEvents } from '../types/events.js'
-import { minSessionMembers, roomStore } from './roomStore.js'
+import { minSessionMembers } from './roomStore.js'
+import { roomStore } from './store.js'
 
-/** Per-room expiry timers so we can retire a room exactly when its window ends. */
-const expiryTimers = new Map<string, NodeJS.Timeout>()
+/**
+ * How often each instance looks for windows that have elapsed.
+ *
+ * Half a second of slack is invisible: clients run their own countdown from `endsAt`
+ * and never wait on the server to reach zero. This push exists to kick a backgrounded
+ * tab, whose local timer a browser throttles to about once a minute.
+ */
+const EXPIRY_POLL_MS = 500
 
-function clearTimer(roomId: string): void {
-  const timer = expiryTimers.get(roomId)
-  if (timer) {
-    clearTimeout(timer)
-    expiryTimers.delete(roomId)
-  }
-}
+/** How many rooms one poll may retire, so a backlog can't monopolise the loop. */
+const EXPIRY_BATCH = 50
 
-function scheduleExpiry(io: IoServer, roomId: string, endsAt: number): void {
-  clearTimer(roomId)
-  const timer = setTimeout(
-    () => {
-      expiryTimers.delete(roomId)
-      // Push the end to present members so they're kicked *immediately* and reliably —
-      // not whenever their local 1s countdown tick happens to fire (which lags, drifts
-      // with the clock offset, and is throttled to ~1/min in a backgrounded tab). This
-      // is distinct from `room:ended` (which is the "joining a dead room" screen); a
-      // present member sees the friendly "time's up" screen off its own `ended` flag.
-      io.to(roomId).emit(SocketEvents.sessionExpired)
-      // Retiring the code makes any future join refuse with `room:ended`. A timer
-      // callback has no caller to catch a rejection, so it is handled here rather than
-      // escaping as an unhandled rejection: the members have already been told the
-      // window is over, and a store that refused the write will be reconciled by the
-      // room's own TTL.
-      void roomStore.endSession(roomId).then(
-        () => logger.info('session.window.expired', { roomId }),
-        (err: unknown) =>
-          logger.error('session.window.expire_failed', { roomId, err: String(err) }),
-      )
-    },
-    Math.max(0, endsAt - Date.now()),
-  )
-  timer.unref()
-  expiryTimers.set(roomId, timer)
-}
-
-/** Start the window, tell the room, and arm its expiry. Callers have done the policy. */
+/** Start the window, tell the room, and record it as due. Callers have done the policy. */
 async function openWindowNow(io: IoServer, roomId: string, trigger: string): Promise<boolean> {
   const endsAt = await roomStore.startWindow(roomId, env.sessionDurationMs)
   if (endsAt === null) return false
   io.to(roomId).emit(SocketEvents.sessionWindow, { endsAt })
-  scheduleExpiry(io, roomId, endsAt)
   logger.info('session.window.start', { roomId, endsAt, trigger })
   return true
+}
+
+/**
+ * Retire the windows that have run out.
+ *
+ * **Polling, not a timer per room.** A `setTimeout` lives in one process, and the whole
+ * point of this work is that the process can go away mid-session: its timer would never
+ * fire and the room would run forever. Asking the store instead means any instance can
+ * finish a window that another one started.
+ *
+ * The store hands each room to exactly one caller (`claimExpired`), so `session:expired`
+ * is emitted once even with several instances polling — and the emit goes through the
+ * adapter, so it reaches members on every node, not just this one.
+ */
+export function startExpiryPoller(io: IoServer): () => void {
+  let running = false
+
+  const tick = async (): Promise<void> => {
+    // Skip rather than overlap: a slow Redis would otherwise stack polls on top of
+    // each other and turn a hiccup into a pile-up.
+    if (running) return
+    running = true
+    try {
+      for (const roomId of await roomStore.claimExpired(Date.now(), EXPIRY_BATCH)) {
+        // Push the end to present members so they're kicked *immediately* and reliably —
+        // not whenever their local countdown tick happens to fire. This is distinct from
+        // `room:ended` (the "joining a dead room" screen); a present member sees the
+        // friendly "time's up" screen off its own `ended` flag.
+        io.to(roomId).emit(SocketEvents.sessionExpired)
+        await roomStore.endSession(roomId)
+        // Retiring the code makes any future join refuse with `room:ended`.
+        logger.info('session.window.expired', { roomId })
+      }
+    } catch (err) {
+      logger.error('session.expiry.failed', { err: err instanceof Error ? err.message : String(err) })
+    } finally {
+      running = false
+    }
+  }
+
+  const timer = setInterval(() => void tick(), EXPIRY_POLL_MS)
+  timer.unref()
+  return () => clearInterval(timer)
 }
 
 /**
@@ -106,12 +122,11 @@ export async function openWindow(
 }
 
 /**
- * Explicit early end (client `session:end`): cancel the timer, retire the room, and
- * notify the other member so it drops to the "room closed" screen. Kept for contract
- * parity — the server-owned window is normally what ends a session.
+ * Explicit early end (client `session:end`): retire the room and notify the other
+ * member so it drops to the "room closed" screen. The store drops the room from the
+ * expiry index as it retires it, so the poller finds nothing later.
  */
 export async function endRoom(socket: AppSocket, roomId: string): Promise<void> {
-  clearTimer(roomId)
   await roomStore.endSession(roomId)
   socket.to(roomId).emit(SocketEvents.roomEnded)
   logger.info('session.end', { roomId })
