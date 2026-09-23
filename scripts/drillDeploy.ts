@@ -4,6 +4,7 @@
  *   npm run drill:deploy -- --target https://realtime-staging.momotoldr.com \
  *                           --origin https://staging.momotoldr.com
  *   npm run drill:deploy -- --expect lose      # assert the pre-Redis behaviour instead
+ *   npm run drill:deploy -- --slow             # also wait out the window on the far side
  *
  * This is the acceptance test for the Redis room store (`docs/PLAN-redis.md`). It holds
  * a real two-person session open, waits for the operator to redeploy the service, and
@@ -18,6 +19,11 @@
  * carrying Railway credentials and a service id inside the repo, for a script whose
  * whole job is to watch from the outside — so it waits for the disconnect instead and
  * tells the operator when to press the button.
+ *
+ * `--slow` adds the other half of the promise, and the one that only a poll can keep: it
+ * waits for the session window — opened by the process that is now gone — to run out,
+ * and checks that the *replacement* ends it. A timer would have died with the old
+ * process and the room would simply run forever.
  *
  * It also reports how long the reconnect took, which is the number the capture path
  * lives or dies by: a gap longer than `OFFLINE_CAPTURE_GRACE_MS` (4s in the frontend)
@@ -53,6 +59,7 @@ function flag(name: string): string | undefined {
 const url = flag('target') ?? 'http://127.0.0.1:3003'
 const origin = flag('origin') ?? 'http://localhost:5173'
 const expectSurvive = (flag('expect') ?? 'survive') !== 'lose'
+const slow = process.argv.includes('--slow')
 /** How long to wait for the operator to start the deploy. */
 const PATIENCE_MS = Number(flag('patience') ?? 420_000)
 
@@ -70,6 +77,7 @@ class Participant {
   sawEnded = false
   sawNotFound = false
   sawPeerLeft = false
+  sawExpired = false
   droppedAt: number | null = null
   reconnectedAt: number | null = null
   /**
@@ -97,6 +105,7 @@ class Participant {
     this.socket.on('room:ended', () => (this.sawEnded = true))
     this.socket.on('room:not-found', () => (this.sawNotFound = true))
     this.socket.on('room:peer-left', () => (this.sawPeerLeft = true))
+    this.socket.on('session:expired', () => (this.sawExpired = true))
     this.socket.on('disconnect', () => {
       this.droppedAt ??= Date.now()
     })
@@ -225,6 +234,29 @@ async function main(): Promise<number> {
       host.lastJoined?.members[0] === host.lastJoined?.selfId,
       'the first member is still the host',
     )
+
+    if (slow) {
+      // The window was opened by a process that no longer exists. Nothing is counting
+      // it down but the replacement's poll of shared state — which is the whole reason
+      // expiry stopped being a per-room timer.
+      const remaining = Math.max(0, before.endsAt - Date.now())
+      console.log('')
+      note(`waiting ${Math.round(remaining / 1000)}s for the inherited window to run out…`)
+      const deadline = Date.now() + remaining + 20_000
+      while (Date.now() < deadline && !(host.sawExpired && guest.sawExpired)) {
+        await sleep(500)
+      }
+      ok(
+        'the replacement ended a window it did not start',
+        host.sawExpired && guest.sawExpired,
+        `host=${host.sawExpired} guest=${guest.sawExpired}`,
+      )
+      await sleep(1_000)
+      const retired = (await (
+        await fetch(`${url}/rooms/${roomId}`, { headers: { origin } })
+      ).json()) as { status: string }
+      ok('and retired the room', retired.status === 'ended', JSON.stringify(retired))
+    }
   }
 
   host.socket.close()

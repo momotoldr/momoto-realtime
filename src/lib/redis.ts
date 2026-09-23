@@ -83,6 +83,21 @@ export function getRedis(): Redis {
     // a couple of seconds so the handler can answer the client, rather than hanging a
     // socket event forever waiting for a service that isn't coming back.
     maxRetriesPerRequest: 2,
+    // The other half of that, and the one a staging outage taught us.
+    //
+    // `maxRetriesPerRequest` only bounds commands that are *sent and fail*. When Redis
+    // stops answering without refusing — a black-holed TCP connection, which is what a
+    // restart behind a private network actually looks like — commands sit in ioredis's
+    // offline queue instead, waiting for a reconnect that takes as long as the connect
+    // timeout. On staging that turned an 11s outage into 11s of hung requests that then
+    // quietly succeeded: not the "fail closed and loud" this design promises, just a
+    // booth that appears frozen with nothing in the logs to explain it.
+    //
+    // Three seconds is well beyond a healthy round trip (single-digit milliseconds on
+    // the private network) and short enough that a person gets an answer rather than a
+    // spinner. Brief blips still ride through on the offline queue; a real outage now
+    // rejects, which is what the client's reconnect path is built for.
+    commandTimeout: 3_000,
     // Cap the reconnect backoff so a long outage still recovers promptly once Redis
     // returns, instead of sitting out an ever-growing delay.
     retryStrategy: (times) => Math.min(times * 200, 2_000),
