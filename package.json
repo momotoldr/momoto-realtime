@@ -13,6 +13,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "check:redis": "tsx scripts/checkRedis.ts",
+    "check:rooms": "tsx scripts/checkRooms.ts",
+    "drill:deploy": "tsx scripts/drillDeploy.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
     "lint": "eslint .",
     "format": "prettier --write .",
