@@ -166,10 +166,13 @@ async function main(): Promise<number> {
         () => reject(new Error('no packet arrived within 5s')),
         5_000,
       ).unref()
-      beta.on('mm:check' as never, ((value: string) => {
-        clearTimeout(timer)
-        resolve(value)
-      }) as never)
+      beta.on(
+        'mm:check' as never,
+        ((value: string) => {
+          clearTimeout(timer)
+          resolve(value)
+        }) as never,
+      )
     })
 
     // Both adapters have to be reading the stream before the packet is written,
