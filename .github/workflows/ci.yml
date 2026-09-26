@@ -1,0 +1,81 @@
+# Checks every pull request into staging or main, and every push to them.
+#
+# The push runs are what Railway's "Wait for CI" waits on: with it enabled, a push to a
+# branch Railway deploys from only deploys once this workflow passes on that commit.
+#
+# Errors are also written as `::error::` annotations, which show on the run summary to
+# anyone — the step logs need a GitHub sign-in.
+name: ci
+
+on:
+  pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A new push to a PR supersedes the old run; a run Railway is waiting on is never cut short.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same field Railway builds with (`engines.node`), so CI and production can't drift apart.
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run format:check
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: Boot test
+        # Starts the built server the way Railway does (node dist/index.js, NODE_ENV
+        # production), waits for /healthz, then sends SIGTERM and expects a clean exit —
+        # the drain path. No REDIS_URL, so the room store is in-memory.
+        env:
+          NODE_ENV: production
+          PORT: '9131'
+          JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef
+        run: |
+          node dist/index.js > boot.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 30); do
+            curl -sf "localhost:$PORT/healthz" > /dev/null && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              cat boot.log
+              echo "::error title=Boot test::the server exited during startup (see the log)"
+              exit 1
+            fi
+            sleep 1
+          done
+          if ! curl -sf "localhost:$PORT/healthz"; then
+            cat boot.log
+            echo "::error title=Boot test::no /healthz response after 30 s"
+            kill -9 "$pid"
+            exit 1
+          fi
+          echo
+          kill -TERM "$pid"
+          ( sleep 20; kill -9 "$pid" 2>/dev/null ) &
+          if wait "$pid"; then code=0; else code=$?; fi
+          cat boot.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=Boot test::exited with $code after SIGTERM — the shutdown handler failed or hung"
+            exit 1
+          fi
