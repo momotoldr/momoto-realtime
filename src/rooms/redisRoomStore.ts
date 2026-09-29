@@ -275,12 +275,61 @@ return cjson.encode({ removed = removed, members = member_ids(room) })
 
 /** The scripts, as ioredis attaches them to the client. */
 interface RoomScripts {
-  mmCreateRoom(room: string, ended: string, live: string, code: string, json: string, now: string, ttl: string): Promise<number>
-  mmJoin(room: string, ended: string, occupied: string, code: string, socketId: string, clientId: string, nodeId: string, now: string, windowGrace: string): Promise<string>
-  mmLeave(room: string, occupied: string, code: string, socketId: string, now: string, reservationTtl: string, windowGrace: string): Promise<string>
-  mmStartWindow(room: string, expiry: string, code: string, durationMs: string, now: string, windowGrace: string): Promise<number>
-  mmEndSession(room: string, ended: string, occupied: string, live: string, expiry: string, code: string, now: string, endedTtl: string): Promise<number>
-  mmReap(room: string, occupied: string, code: string, now: string, grace: string, windowGrace: string): Promise<string>
+  mmCreateRoom(
+    room: string,
+    ended: string,
+    live: string,
+    code: string,
+    json: string,
+    now: string,
+    ttl: string,
+  ): Promise<number>
+  mmJoin(
+    room: string,
+    ended: string,
+    occupied: string,
+    code: string,
+    socketId: string,
+    clientId: string,
+    nodeId: string,
+    now: string,
+    windowGrace: string,
+  ): Promise<string>
+  mmLeave(
+    room: string,
+    occupied: string,
+    code: string,
+    socketId: string,
+    now: string,
+    reservationTtl: string,
+    windowGrace: string,
+  ): Promise<string>
+  mmStartWindow(
+    room: string,
+    expiry: string,
+    code: string,
+    durationMs: string,
+    now: string,
+    windowGrace: string,
+  ): Promise<number>
+  mmEndSession(
+    room: string,
+    ended: string,
+    occupied: string,
+    live: string,
+    expiry: string,
+    code: string,
+    now: string,
+    endedTtl: string,
+  ): Promise<number>
+  mmReap(
+    room: string,
+    occupied: string,
+    code: string,
+    now: string,
+    grace: string,
+    windowGrace: string,
+  ): Promise<string>
 }
 
 type ScriptedRedis = Redis & RoomScripts
@@ -371,7 +420,11 @@ export class RedisRoomStore implements RoomStore {
     return room ? room.members.map((m) => m.socketId) : []
   }
 
-  async join(roomId: string, socketId: string, clientId: string | null = null): Promise<JoinResult> {
+  async join(
+    roomId: string,
+    socketId: string,
+    clientId: string | null = null,
+  ): Promise<JoinResult> {
     const raw = await this.redis.mmJoin(
       K.room(roomId),
       K.ended(roomId),
@@ -447,7 +500,14 @@ export class RedisRoomStore implements RoomStore {
    * how many processes are running.
    */
   async claimExpired(now: number = Date.now(), limit = 50): Promise<string[]> {
-    const due = await this.redis.zrangebyscore(K.expiry, '-inf', String(now), 'LIMIT', '0', String(limit))
+    const due = await this.redis.zrangebyscore(
+      K.expiry,
+      '-inf',
+      String(now),
+      'LIMIT',
+      '0',
+      String(limit),
+    )
     if (due.length === 0) return []
     const claimed: string[] = []
     for (const roomId of due) {

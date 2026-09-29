@@ -102,7 +102,7 @@ async function main(): Promise<number> {
     })
 
   /** Resolve with the event's payload, or `null` if it never arrives. */
-  const expect = <T = unknown,>(socket: Socket, event: string, ms = 4_000): Promise<T | null> =>
+  const expect = <T = unknown>(socket: Socket, event: string, ms = 4_000): Promise<T | null> =>
     new Promise((resolve) => {
       const timer = setTimeout(() => resolve(null), ms)
       socket.once(event, (payload: T) => {
@@ -224,12 +224,18 @@ async function main(): Promise<number> {
     const g2Join = expect<Joined>(g2, 'room:joined')
     g2.emit('room:join', group)
     await g2Join
-    ok('a group room does not auto-start at two', (await expect(g1, 'session:window', 1_500)) === null)
+    ok(
+      'a group room does not auto-start at two',
+      (await expect(g1, 'session:window', 1_500)) === null,
+    )
 
     g2.emit('session:open')
     ok('a non-host cannot open the window', (await expect(g1, 'session:window', 1_500)) === null)
     g1.emit('session:open')
-    ok('the host cannot open it under the floor', (await expect(g1, 'session:window', 1_500)) === null)
+    ok(
+      'the host cannot open it under the floor',
+      (await expect(g1, 'session:window', 1_500)) === null,
+    )
 
     const g3 = await connect('check-g3')
     const g3Join = expect<Joined>(g3, 'room:joined')
@@ -260,7 +266,10 @@ async function main(): Promise<number> {
     const echo = expect<{ t0: number; t1: number }>(alice, 'time:sync:res', 3_000)
     alice.emit('time:sync', t0)
     const clock = await echo
-    ok('time:sync echoes the client stamp with the server clock', clock?.t0 === t0 && typeof clock.t1 === 'number')
+    ok(
+      'time:sync echoes the client stamp with the server clock',
+      clock?.t0 === t0 && typeof clock.t1 === 'number',
+    )
 
     // A synchronized countdown: one instant, sent to everyone including the sender.
     const aliceCountdown = expect<{ startAt: number }>(alice, 'session:countdown-start', 3_000)
@@ -268,15 +277,27 @@ async function main(): Promise<number> {
     alice.emit('session:start')
     const [aStart, bStart] = [await aliceCountdown, await bobCountdown]
     ok('session:start reaches both members', aStart !== null && bStart !== null)
-    ok('both are given the same start instant', aStart?.startAt === bStart?.startAt, `startAt=${aStart?.startAt}`)
+    ok(
+      'both are given the same start instant',
+      aStart?.startAt === bStart?.startAt,
+      `startAt=${aStart?.startAt}`,
+    )
 
     // A single-slot retake, likewise synced to both.
-    const aliceRetake = expect<{ slot: number; startAt: number }>(alice, 'session:retake-start', 3_000)
+    const aliceRetake = expect<{ slot: number; startAt: number }>(
+      alice,
+      'session:retake-start',
+      3_000,
+    )
     const bobRetake = expect<{ slot: number; startAt: number }>(bob, 'session:retake-start', 3_000)
     bob.emit('session:retake', { slot: 2 })
     const [aRetake, bRetake] = [await aliceRetake, await bobRetake]
     ok('session:retake syncs the slot to both', aRetake?.slot === 2 && bRetake?.slot === 2)
-    ok('a guest may drive capture, not only the host', aRetake !== null, 'the UI offers Retake to both')
+    ok(
+      'a guest may drive capture, not only the host',
+      aRetake !== null,
+      'the UI offers Retake to both',
+    )
 
     // "Retake all" is the one capture event that must NOT come back to its sender.
     const bobReset = expect(bob, 'session:reset', 3_000)
@@ -286,7 +307,11 @@ async function main(): Promise<number> {
     ok('session:reset does not echo to its sender', (await aliceReset) === null)
 
     // Peer discovery: the broadcast announce, with `from` stamped by the server.
-    const bobAnnounce = expect<{ peerJsId: string; from: string; directed: boolean }>(bob, 'peer:announce', 3_000)
+    const bobAnnounce = expect<{ peerJsId: string; from: string; directed: boolean }>(
+      bob,
+      'peer:announce',
+      3_000,
+    )
     alice.emit('peer:announce', { peerJsId: 'peerjs-alice' })
     const announced = await bobAnnounce
     ok('peer:announce is relayed to the room', announced?.peerJsId === 'peerjs-alice')
@@ -305,15 +330,29 @@ async function main(): Promise<number> {
     ok('an announce cannot be aimed at a socket outside the room', (await leaked) === null)
 
     // Media state and the strip relays, forwarded verbatim.
-    const mediaState = expect<{ cam: boolean; mic: boolean; from: string }>(bob, 'peer:media-state', 3_000)
+    const mediaState = expect<{ cam: boolean; mic: boolean; from: string }>(
+      bob,
+      'peer:media-state',
+      3_000,
+    )
     alice.emit('peer:media-state', { cam: false, mic: true })
     const media = await mediaState
-    ok('peer:media-state is relayed with `from`', media?.cam === false && media.mic === true && media.from === aliceId)
+    ok(
+      'peer:media-state is relayed with `from`',
+      media?.cam === false && media.mic === true && media.from === aliceId,
+    )
 
-    const config = expect<{ layout: string; color: string | null; confirmed: boolean }>(bob, 'strip:config', 3_000)
+    const config = expect<{ layout: string; color: string | null; confirmed: boolean }>(
+      bob,
+      'strip:config',
+      3_000,
+    )
     alice.emit('strip:config', { layout: 'ribbon-4x1', color: 'cream', confirmed: true })
     const relayedConfig = await config
-    ok('strip:config is relayed verbatim', relayedConfig?.layout === 'ribbon-4x1' && relayedConfig.color === 'cream')
+    ok(
+      'strip:config is relayed verbatim',
+      relayedConfig?.layout === 'ribbon-4x1' && relayedConfig.color === 'cream',
+    )
 
     const shots = expect<{ hasShots: boolean }>(bob, 'strip:shots', 3_000)
     alice.emit('strip:shots', { hasShots: true })
@@ -332,7 +371,7 @@ async function main(): Promise<number> {
     const strangerEnd = await connect('check-stranger')
     const wrongfulEnd = expect(bob, 'room:ended', 1_500)
     strangerEnd.emit('session:end', booth)
-    ok('a stranger cannot end someone else\'s session', (await wrongfulEnd) === null)
+    ok("a stranger cannot end someone else's session", (await wrongfulEnd) === null)
 
     alice.emit('session:end', booth)
     await sleep(300)

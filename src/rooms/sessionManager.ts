@@ -58,7 +58,9 @@ export function startExpiryPoller(io: IoServer): () => void {
         logger.info('session.window.expired', { roomId })
       }
     } catch (err) {
-      logger.error('session.expiry.failed', { err: err instanceof Error ? err.message : String(err) })
+      logger.error('session.expiry.failed', {
+        err: err instanceof Error ? err.message : String(err),
+      })
     } finally {
       running = false
     }

@@ -196,7 +196,11 @@ async function main(): Promise<number> {
 
   const hostGap = host.gapMs
   const guestGap = guest.gapMs
-  ok('both clients reconnected', hostGap !== null && guestGap !== null, `host=${hostGap}ms guest=${guestGap}ms`)
+  ok(
+    'both clients reconnected',
+    hostGap !== null && guestGap !== null,
+    `host=${hostGap}ms guest=${guestGap}ms`,
+  )
   ok(
     `the gap stayed inside the ${CAPTURE_GRACE_MS}ms capture budget`,
     (hostGap ?? Infinity) < CAPTURE_GRACE_MS && (guestGap ?? Infinity) < CAPTURE_GRACE_MS,
@@ -204,7 +208,9 @@ async function main(): Promise<number> {
   )
 
   // The verdict: is the room still the same room?
-  const status = (await (await fetch(`${url}/rooms/${roomId}`, { headers: { origin } })).json()) as {
+  const status = (await (
+    await fetch(`${url}/rooms/${roomId}`, { headers: { origin } })
+  ).json()) as {
     status: string
     members: number
   }
