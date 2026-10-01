@@ -9,6 +9,12 @@ export interface Env {
   corsOrigins: string[]
   /** How many reverse-proxy hops sit in front of us (Express `trust proxy`). */
   trustProxy: number
+  /**
+   * A header carrying the visitor's address, set by the CDN in front of us — behind
+   * Cloudflare, `cf-connecting-ip`. Wins over `req.ip`, which behind Cloudflare + Railway
+   * never resolves to the visitor. See `lib/clientIp.ts`.
+   */
+  clientIpHeader: string | null
   sessionDurationMs: number
   startDelayMs: number
   /**
@@ -147,12 +153,12 @@ export const env: Env = {
   // 3003 locally: momoto-core keeps 3001 and momoto-notify holds 3002.
   port: positiveInt('PORT', process.env.PORT, 3003),
   corsOrigins: parseOrigins(process.env.CORS_ORIGINS),
-  // Number of proxies between the client and us. Getting this wrong silently breaks
-  // every per-IP rate limit: too low and `req.ip` is a proxy address shared by all
-  // users (one bucket for everyone); too high and a client can spoof `X-Forwarded-For`
-  // to mint unlimited buckets. One platform proxy = 1. Behind a proxying Cloudflare
-  // ("orange cloud") = 2. Verify after deploy by logging `req.ip`.
+  // Number of proxies between the client and us, for `req.ip`. Behind Cloudflare no value
+  // is right — the X-Forwarded-For reaching us holds no visitor address at all (measured
+  // 2026-10-01) — so there the rate limits key on CLIENT_IP_HEADER instead, and this only
+  // matters for the fallback. Railway alone = 1.
   trustProxy: nonNegativeInt('TRUST_PROXY', process.env.TRUST_PROXY, 1),
+  clientIpHeader: process.env.CLIENT_IP_HEADER?.trim().toLowerCase() || null,
   // Keep in step with the frontend's SESSION_SECONDS (store/useSessionStore), which
   // is the same window for solo rooms — solo never connects, so it can't be told by
   // the server and the two values have to be set to match by hand.

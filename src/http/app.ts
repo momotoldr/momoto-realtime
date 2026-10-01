@@ -23,11 +23,10 @@ import { turnRouter } from './routes/turn.js'
 export function createApp(): Express {
   const app = express()
 
-  // In production we sit behind a reverse proxy, which puts the real client IP in
-  // `X-Forwarded-For`. Without this, `req.ip` is the proxy's address for every request,
-  // so the per-IP rate limits (rooms, TURN) would throttle all users as if they were
-  // one. The hop count is env-driven because it depends on the deploy topology — see
-  // `TRUST_PROXY` in config/env.ts.
+  // `req.ip` from the proxy chain. Behind Cloudflare + Railway it never resolves to the
+  // visitor (X-Forwarded-For carries only infrastructure addresses there), so the per-IP
+  // rate limits (rooms, TURN) key on `clientIp()` instead, which prefers
+  // `CLIENT_IP_HEADER` (`cf-connecting-ip`); this setting only matters for that fallback.
   app.set('trust proxy', env.trustProxy)
 
   // Baseline response headers (nosniff, HSTS, referrer policy, frame denial). This is

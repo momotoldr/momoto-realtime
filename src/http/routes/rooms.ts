@@ -1,6 +1,8 @@
 import { Router } from 'express'
 
 import { env } from '../../config/env.js'
+import { clientIp } from '../../lib/clientIp.js'
+import { ipPrefix } from '../../lib/ipPrefix.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
 import { roomStore } from '../../rooms/store.js'
@@ -44,9 +46,10 @@ export function sweepRoomCreateLimits(now: number = Date.now()): number {
  * with group mode enabled meets when the server has not raised `ROOM_CAPACITY_MAX`.
  */
 roomsRouter.post('/', async (req, res, next) => {
-  const key = req.ip ?? 'unknown'
+  const ip = clientIp(req, env.clientIpHeader)
+  const key = ip ?? 'unknown'
   if (!createLimiter.allow(key)) {
-    logger.warn('room.create.ratelimited', { ip: req.ip })
+    logger.warn('room.create.ratelimited', { ipPrefix: ipPrefix(ip) })
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
@@ -59,7 +62,7 @@ roomsRouter.post('/', async (req, res, next) => {
       requested < 2 ||
       requested > env.roomCapacityMax)
   ) {
-    logger.warn('room.create.invalid_capacity', { ip: req.ip, requested })
+    logger.warn('room.create.invalid_capacity', { ipPrefix: ipPrefix(ip), requested })
     res.status(400).json({ error: 'invalid_capacity', maxCapacity: env.roomCapacityMax })
     return
   }
@@ -99,9 +102,10 @@ roomsRouter.post('/', async (req, res, next) => {
  * mode; `status` alone is unchanged, so an older client reading only that keeps working.
  */
 roomsRouter.get('/:id', async (req, res, next) => {
-  const key = req.ip ?? 'unknown'
+  const ip = clientIp(req, env.clientIpHeader)
+  const key = ip ?? 'unknown'
   if (!lookupLimiter.allow(key)) {
-    logger.warn('room.lookup.ratelimited', { ip: req.ip })
+    logger.warn('room.lookup.ratelimited', { ipPrefix: ipPrefix(ip) })
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
