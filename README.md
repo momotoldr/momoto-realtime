@@ -78,7 +78,7 @@ All configuration is via environment variables. Full notes in `.env.example`.
 | `ROOM_CAPACITY` | `2` | Seats a room is minted with by default. |
 | `ROOM_CAPACITY_MAX` | `2` | Largest capacity `POST /rooms` accepts (ceiling 4). The enforcement half of the FE's `VITE_GROUP_MODE_ENABLED`. |
 | `ROOMS_MAX_ACTIVE` | `5000` | Live-room safety valve; new rooms get `503 booth_busy` above it, joins never gated. |
-| `REDIS_URL` | _(unset)_ | Reserved for the multi-instance scale path. |
+| `REDIS_URL` | _(unset)_ | **Where room state lives.** Set it and rooms survive a redeploy (and a second instance becomes possible); leave it unset and rooms live in this process's memory, which is right for local dev and means every restart ends every room. Selected once at boot — there is no runtime fallback in either direction. Set in staging and production; unset locally. |
 | `STUN_URLS` | `stun:stun.l.google.com:19302` | Comma-separated STUN URLs served via `/turn-credentials`. |
 | `TURN_URLS` | _(unset)_ | Comma-separated TURN URLs. Set with `TURN_STATIC_AUTH_SECRET` to enable coturn-style TURN. |
 | `TURN_STATIC_AUTH_SECRET` | _(unset)_ | Shared secret for HMAC TURN credentials. Never sent to clients. |
