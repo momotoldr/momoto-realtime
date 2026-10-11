@@ -1,7 +1,9 @@
-import { isIP } from 'node:net'
+import type { IncomingHttpHeaders } from 'node:http'
+import { isIP, isIPv4, isIPv6 } from 'node:net'
 
 import type { Request } from 'express'
 
+import { expandIPv6 } from './ipPrefix.js'
 import { logger } from './logger.js'
 
 /**
@@ -40,3 +42,36 @@ export function clientIp(req: Request, header: string | null): string | undefine
 }
 
 let reported = false
+
+/**
+ * `clientIp` for a Socket.io handshake, which carries the upgrade request's headers and
+ * the connection's own address rather than an Express `Request`. Same rule: the
+ * configured header when it holds a valid address, the socket's address otherwise.
+ */
+export function handshakeIp(
+  handshake: { headers: IncomingHttpHeaders; address: string },
+  header: string | null,
+): string | undefined {
+  const raw = header ? handshake.headers[header.toLowerCase()] : undefined
+  const value = (Array.isArray(raw) ? raw[0] : raw)?.split(',')[0]?.trim()
+  if (value && isIP(value) !== 0) return value
+  return handshake.address || undefined
+}
+
+/**
+ * The bucket a per-address rate limit counts against: the address itself for IPv4, but
+ * the /64 prefix for IPv6.
+ *
+ * One IPv6 subscriber is routinely handed a whole /64 — 2^64 addresses — so keying on the
+ * full address would let a single machine step to a fresh address per request and never
+ * meet a limit. A /64 is what one home or one server gets, so it is the smallest unit
+ * that is still one party.
+ */
+export function rateLimitKey(ip: string | undefined): string {
+  if (!ip) return 'unknown'
+  // An IPv4 client seen through a dual-stack socket arrives as `::ffff:1.2.3.4`.
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip
+  if (isIPv4(v4)) return v4
+  if (isIPv6(ip)) return `${expandIPv6(ip).slice(0, 4).join(':')}::/64`
+  return ip
+}

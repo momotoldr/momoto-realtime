@@ -5,6 +5,7 @@ import { Server, type Socket } from 'socket.io'
 
 import { verifyAccessToken } from '../auth/verifyAccessToken.js'
 import { env } from '../config/env.js'
+import { handshakeIp, rateLimitKey } from '../lib/clientIp.js'
 import { logger } from '../lib/logger.js'
 import { getRedis, redisEnabled } from '../lib/redis.js'
 import { registerRelayHandlers } from './handlers/relayHandlers.js'
@@ -81,6 +82,11 @@ export function createSocketServer(httpServer: HttpServer): IoServer {
   // recovers by refreshing and reconnecting. (Solo mode never connects, so it's
   // unaffected.) Room mechanics are keyed on the socket id, not the user id.
   io.use((socket, next) => {
+    // The visitor's address, by the same rule as the HTTP routes (`CLIENT_IP_HEADER`
+    // first), so a guest's join limit and its room-code guesses count against where it
+    // connects from rather than a socket id it can renew by reconnecting.
+    socket.data.ipKey = rateLimitKey(handshakeIp(socket.handshake, env.clientIpHeader))
+
     // Stable per-tab id the client keeps across reconnects and reloads. It carries no
     // authority — it only lets `roomStore.join` tell "the same client coming back"
     // from "a third person arriving", so a dropped connection can reclaim its own

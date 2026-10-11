@@ -8,6 +8,7 @@ import { env } from './config/env.js'
 import { createApp } from './http/app.js'
 import { sweepRoomCreateLimits } from './http/routes/rooms.js'
 import { sweepTurnLimits } from './http/routes/turn.js'
+import { sweepCodeGuessLimits } from './rooms/codeGuessLimiter.js'
 import { beginDraining } from './lifecycle.js'
 import { closeRedis, redisEnabled } from './lib/redis.js'
 import { logger } from './lib/logger.js'
@@ -73,6 +74,7 @@ async function sweep(): Promise<void> {
     sweepSocketLimits()
     sweepRoomCreateLimits()
     sweepTurnLimits()
+    sweepCodeGuessLimits()
   } catch (err) {
     logger.error('sweep.failed', { err: String(err) })
   }
