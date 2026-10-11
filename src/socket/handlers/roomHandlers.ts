@@ -1,14 +1,25 @@
 import { isDraining } from '../../lifecycle.js'
 import { logger } from '../../lib/logger.js'
+import { codeGuessLimiter } from '../../rooms/codeGuessLimiter.js'
 import { roomStore } from '../../rooms/store.js'
 import { endRoom, handleWindowOnJoin, openWindow } from '../../rooms/sessionManager.js'
 import { SocketEvents } from '../../types/events.js'
 import { runSocketOp } from '../guard.js'
 import type { AppSocket, IoServer } from '../server.js'
-import { joinLimiter, limitKey } from '../rateLimits.js'
+import { joinKey, joinLimiter } from '../rateLimits.js'
 import { isValidRoomId, isValidSessionEnd } from '../validate.js'
 
 async function joinRoom(io: IoServer, socket: AppSocket, roomId: string): Promise<void> {
+  // Out of guesses: answer as if the code were wrong, without looking. Saying "slow
+  // down" instead would tell a guesser exactly when to switch address, and a real
+  // member never gets here (see `codeGuessLimiter`).
+  const guessKey = socket.data.ipKey ?? `socket:${socket.id}`
+  if (!codeGuessLimiter.peek(guessKey)) {
+    socket.emit(SocketEvents.roomNotFound)
+    logger.warn('room.join.guess_limited', { socketId: socket.id })
+    return
+  }
+
   const result = await roomStore.join(roomId, socket.id, socket.data.clientId ?? null)
 
   if (result.status === 'ended') {
@@ -22,6 +33,7 @@ async function joinRoom(io: IoServer, socket: AppSocket, roomId: string): Promis
     return
   }
   if (result.status === 'not_found') {
+    codeGuessLimiter.allow(guessKey)
     socket.emit(SocketEvents.roomNotFound)
     logger.info('room.join.refused', { socketId: socket.id, roomId, reason: 'not_found' })
     return
@@ -88,7 +100,7 @@ export function registerRoomHandlers(io: IoServer, socket: AppSocket): void {
       logger.warn('room.join.invalid', { socketId: socket.id })
       return
     }
-    if (!joinLimiter.allow(limitKey(socket))) {
+    if (!joinLimiter.allow(joinKey(socket))) {
       logger.warn('room.join.ratelimited', { socketId: socket.id })
       return
     }

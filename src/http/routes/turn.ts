@@ -1,7 +1,7 @@
 import { Router } from 'express'
 
 import { env } from '../../config/env.js'
-import { clientIp } from '../../lib/clientIp.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { ipPrefix } from '../../lib/ipPrefix.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
@@ -34,7 +34,7 @@ export function sweepTurnLimits(now: number = Date.now()): number {
  */
 turnRouter.get('/', async (req, res) => {
   const ip = clientIp(req, env.clientIpHeader)
-  const key = ip ?? 'unknown'
+  const key = rateLimitKey(ip)
   if (!turnLimiter.allow(key)) {
     logger.warn('turn.credentials.ratelimited', { ipPrefix: ipPrefix(ip) })
     res.status(429).json({ error: 'too_many_requests' })

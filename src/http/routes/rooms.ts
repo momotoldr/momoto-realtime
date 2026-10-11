@@ -1,10 +1,11 @@
 import { Router } from 'express'
 
 import { env } from '../../config/env.js'
-import { clientIp } from '../../lib/clientIp.js'
+import { clientIp, rateLimitKey } from '../../lib/clientIp.js'
 import { ipPrefix } from '../../lib/ipPrefix.js'
 import { logger } from '../../lib/logger.js'
 import { RateLimiter } from '../../lib/rateLimiter.js'
+import { codeGuessLimiter } from '../../rooms/codeGuessLimiter.js'
 import { roomStore } from '../../rooms/store.js'
 
 export const roomsRouter = Router()
@@ -47,7 +48,7 @@ export function sweepRoomCreateLimits(now: number = Date.now()): number {
  */
 roomsRouter.post('/', async (req, res, next) => {
   const ip = clientIp(req, env.clientIpHeader)
-  const key = ip ?? 'unknown'
+  const key = rateLimitKey(ip)
   if (!createLimiter.allow(key)) {
     logger.warn('room.create.ratelimited', { ipPrefix: ipPrefix(ip) })
     res.status(429).json({ error: 'too_many_requests' })
@@ -103,14 +104,23 @@ roomsRouter.post('/', async (req, res, next) => {
  */
 roomsRouter.get('/:id', async (req, res, next) => {
   const ip = clientIp(req, env.clientIpHeader)
-  const key = ip ?? 'unknown'
+  const key = rateLimitKey(ip)
   if (!lookupLimiter.allow(key)) {
     logger.warn('room.lookup.ratelimited', { ipPrefix: ipPrefix(ip) })
     res.status(429).json({ error: 'too_many_requests' })
     return
   }
+  // Out of guesses (failed lookups here and failed socket joins share one budget — see
+  // `codeGuessLimiter`): refuse before looking, so the answer says nothing about the code.
+  if (!codeGuessLimiter.peek(key)) {
+    logger.warn('room.lookup.guess_limited', { ipPrefix: ipPrefix(ip) })
+    res.status(429).json({ error: 'too_many_requests' })
+    return
+  }
   try {
-    res.json(await roomStore.getStatus(req.params.id))
+    const status = await roomStore.getStatus(req.params.id)
+    if (status.status === 'not_found') codeGuessLimiter.allow(key)
+    res.json(status)
   } catch (err) {
     next(err)
   }
