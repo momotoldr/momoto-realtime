@@ -225,4 +225,10 @@ export interface SocketData {
   clientId?: string
   /** Set by the handshake auth guard — the authenticated user's id. */
   userId?: string
+  /**
+   * The connection's address as a rate-limit bucket (`rateLimitKey`), set by the
+   * handshake guard. What a guest's limits count against, since a guest has no account
+   * and its socket id is new on every reconnect.
+   */
+  ipKey?: string
 }
