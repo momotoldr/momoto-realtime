@@ -59,10 +59,9 @@ export function redisIsReady(): boolean {
 /**
  * The shared connection, created on first use.
  *
- * One connection for the whole process: room mutations are Lua scripts (atomic in a
+ * One connection for all app commands: room mutations are Lua scripts (atomic in a
  * single round trip), so nothing here needs a connection of its own. The Socket.io
- * Streams adapter is handed this same client and duplicates it internally for its
- * blocking `XREAD`s, so those never stall an app command.
+ * Streams adapter does *not* get this client — see `getAdapterRedis`.
  *
  * Throws when `REDIS_URL` is unset. Callers are expected to have branched on
  * `redisEnabled` at boot; reaching here without it is a wiring bug, not a runtime
@@ -121,16 +120,48 @@ export function getRedis(): Redis {
   return client
 }
 
+let adapterClient: Redis | null = null
+
 /**
- * Close the connection on shutdown. `quit()` finishes in-flight commands first; a
+ * The connection the Socket.io Streams adapter is built on: the shared one's options,
+ * minus `commandTimeout`.
+ *
+ * The adapter duplicates whatever it is handed for its read loop, `XREAD BLOCK 5000`,
+ * and ioredis applies `commandTimeout` to blocking commands too. With the shared
+ * client's 3s that read was rejected every time and re-sent at once, while Redis still
+ * served the abandoned ones in order, one per block — so ioredis's command queue grew
+ * by ~11k entries a day (≈27 MB/day of heap, prod and staging alike, until the next
+ * deploy), and a reply that landed on a command already given up on was dropped — a
+ * broadcast from another instance lost (3 of 8 in a local two-instance test).
+ *
+ * Without the timeout the adapter's own block is the bound on a read. Its publishes
+ * (`XADD`) go through this connection too and lose the 3s cap, which is acceptable: a
+ * broadcast that waits out a blip is what the Streams adapter is for, and a dead
+ * connection still fails through `maxRetriesPerRequest`.
+ */
+export function getAdapterRedis(): Redis {
+  if (adapterClient) return adapterClient
+  adapterClient = getRedis().duplicate({ commandTimeout: undefined })
+  // Same reason as the shared client: an `error` with no listener ends the process.
+  adapterClient.on('error', (err: Error) =>
+    logger.error('redis.adapter.error', { err: err.message }),
+  )
+  return adapterClient
+}
+
+/**
+ * Close the connections on shutdown. `quit()` finishes in-flight commands first; a
  * connection that is already gone is not an error worth failing a shutdown over.
  */
 export async function closeRedis(): Promise<void> {
-  if (!client) return
-  try {
-    await client.quit()
-  } catch {
-    client.disconnect()
+  for (const conn of [adapterClient, client]) {
+    if (!conn) continue
+    try {
+      await conn.quit()
+    } catch {
+      conn.disconnect()
+    }
   }
+  adapterClient = null
   client = null
 }
