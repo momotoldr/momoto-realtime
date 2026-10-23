@@ -7,7 +7,7 @@ import { verifyAccessToken } from '../auth/verifyAccessToken.js'
 import { env } from '../config/env.js'
 import { handshakeIp, rateLimitKey } from '../lib/clientIp.js'
 import { logger } from '../lib/logger.js'
-import { getRedis, redisEnabled } from '../lib/redis.js'
+import { getAdapterRedis, redisEnabled } from '../lib/redis.js'
 import { registerRelayHandlers } from './handlers/relayHandlers.js'
 import { registerRoomHandlers } from './handlers/roomHandlers.js'
 import { registerSyncHandlers } from './handlers/syncHandlers.js'
@@ -64,14 +64,15 @@ export function createSocketServer(httpServer: HttpServer): IoServer {
     // The **Streams** adapter, not the pub/sub one: it resumes the stream after a brief
     // Redis disconnect without losing packets, where pub/sub would silently deliver only
     // to local clients while severed — and "your friend's countdown never arrived" is
-    // exactly the bug this whole change exists to prevent. It also duplicates its own
-    // connections internally for the blocking reads, so handing it the shared client
-    // does not stall an app command.
+    // exactly the bug this whole change exists to prevent. It duplicates its own
+    // connection internally for the blocking reads, so they never stall an app command;
+    // it gets a client without `commandTimeout`, though, which would cut every one of
+    // those reads short (see `getAdapterRedis`).
     //
     // Without it the server is correct but alone: during a deploy the host can sit on
     // the old instance and the guest on the new one, and nothing either says would reach
     // the other.
-    ...(redisEnabled ? { adapter: createAdapter(getRedis()) } : {}),
+    ...(redisEnabled ? { adapter: createAdapter(getAdapterRedis()) } : {}),
   })
 
   // Handshake auth is optional: rooms are open so a guest can try the booth before
