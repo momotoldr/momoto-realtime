@@ -44,6 +44,11 @@ export function createApp(): Express {
   // `credentials: true` to match momoto-core: the frontend's shared axios client sends
   // `withCredentials` on every call, and a CORS response without this is refused.
   app.use(cors({ origin: env.corsOrigins, credentials: true }))
+  // Everything here is live state or a credential (TURN), so nothing should be kept.
+  app.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store')
+    next()
+  })
   // Only `POST /rooms { capacity }` has a body here, and it's a single number.
   app.use(express.json({ limit: '1kb' }))
 

@@ -8,6 +8,7 @@ import { env } from '../config/env.js'
 import { handshakeIp, rateLimitKey } from '../lib/clientIp.js'
 import { logger } from '../lib/logger.js'
 import { getAdapterRedis, redisEnabled } from '../lib/redis.js'
+import { ConnectionLimit, eventBudget } from './connectionLimit.js'
 import { registerRelayHandlers } from './handlers/relayHandlers.js'
 import { registerRoomHandlers } from './handlers/roomHandlers.js'
 import { registerSyncHandlers } from './handlers/syncHandlers.js'
@@ -110,7 +111,24 @@ export function createSocketServer(httpServer: HttpServer): IoServer {
     }
   })
 
+  const connectionLimit = new ConnectionLimit(env.socketMaxPerAddress)
+
   io.on('connection', (socket) => {
+    // Counted here rather than in `io.use`: this event pairs reliably with `disconnect`,
+    // while a client that drops mid-handshake would leak a slot claimed any earlier.
+    // `unknown` means no address could be read, and those can't share one bucket.
+    const address = socket.data.ipKey
+    if (address && address !== 'unknown') {
+      if (!connectionLimit.acquire(address)) {
+        logger.warn('socket.refused.address_limit', { socketId: socket.id })
+        socket.disconnect(true)
+        return
+      }
+      socket.once('disconnect', () => connectionLimit.release(address))
+    }
+
+    socket.use(eventBudget(socket.id))
+
     logger.info('socket.connected', { socketId: socket.id, userId: socket.data.userId })
     registerRoomHandlers(io, socket)
     registerSyncHandlers(io, socket)

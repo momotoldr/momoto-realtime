@@ -2,6 +2,8 @@
 // other import here, and `src/index.ts` imports it first of all for the same reason.
 import './loadEnv.js'
 
+import { createPublicKey, type KeyObject } from 'node:crypto'
+
 import { logger } from '../lib/logger.js'
 
 export interface Env {
@@ -47,6 +49,11 @@ export interface Env {
    * reached mid-session never separates a pair.
    */
   roomsMaxActive: number
+  /**
+   * Most open sockets one address may hold on this instance. Generous because a campus or
+   * a mobile carrier can put thousands of people behind one address.
+   */
+  socketMaxPerAddress: number
   redisUrl: string | null
   stunUrls: string[]
   turnUrls: string[]
@@ -58,11 +65,15 @@ export interface Env {
   /** Cloudflare Realtime TURN API token (secret). Mints short-lived credentials. */
   cloudflareTurnApiToken: string | null
   /**
-   * Verifies the access tokens `momoto-core` signs. This service never mints one, so it
-   * needs no TTLs — but the value must be **identical** to core's, or every signed-in
-   * socket handshake is refused as `unauthorized`.
+   * Verifies ES256 access tokens. Can't mint one, so a leak here can't forge a login.
+   * At least one of this and `jwtSecret` is required.
    */
-  jwtSecret: string
+  jwtPublicKey: KeyObject | null
+  /**
+   * Verifies HS256 access tokens, and could mint them too. Must be **identical** to core's
+   * while it is set. Remove it once core signs with its private key.
+   */
+  jwtSecret: string | null
 }
 
 const DEFAULT_DEV_ORIGIN = 'http://localhost:5173'
@@ -108,13 +119,32 @@ function nonNegativeInt(name: string, raw: string | undefined, fallback: number)
   return n
 }
 
-/** Require a non-empty secret from the environment (never hardcode secrets). */
-function requiredSecret(name: string, raw: string | undefined): string {
+/**
+ * The P-256 key from `JWT_PUBLIC_KEY`, or null. A PEM (real or `\n`-escaped newlines) or
+ * the same PEM in base64. Copied in momoto-analytics (no shared package between services).
+ */
+function parseJwtPublicKey(raw: string | undefined): KeyObject | null {
   const value = raw?.trim()
-  if (!value) {
-    throw new Error(`Missing ${name}: set it in the environment (see .env.example).`)
+  if (!value) return null
+  const pem = value.includes('-----BEGIN')
+    ? value.replace(/\\n/g, '\n')
+    : Buffer.from(value, 'base64').toString('utf8')
+  let key: KeyObject
+  try {
+    key = createPublicKey(pem)
+  } catch {
+    throw new Error('Invalid JWT_PUBLIC_KEY: not a readable public key.')
   }
-  return value
+  if (key.asymmetricKeyDetails?.namedCurve !== 'prime256v1') {
+    throw new Error('Invalid JWT_PUBLIC_KEY: expected an EC key on the P-256 curve.')
+  }
+  return key
+}
+
+const jwtPublicKey = parseJwtPublicKey(process.env.JWT_PUBLIC_KEY)
+const jwtSecret = process.env.JWT_SECRET?.trim() || null
+if (!jwtPublicKey && !jwtSecret) {
+  throw new Error('Missing JWT_PUBLIC_KEY or JWT_SECRET: set one (see .env.example).')
 }
 
 /**
@@ -167,6 +197,11 @@ export const env: Env = {
   roomCapacityDefault,
   roomCapacityMax,
   roomsMaxActive: positiveInt('ROOMS_MAX_ACTIVE', process.env.ROOMS_MAX_ACTIVE, 5_000),
+  socketMaxPerAddress: positiveInt(
+    'SOCKET_MAX_PER_ADDRESS',
+    process.env.SOCKET_MAX_PER_ADDRESS,
+    200,
+  ),
   redisUrl: process.env.REDIS_URL?.trim() || null,
   stunUrls: (() => {
     const urls = parseCsv(process.env.STUN_URLS)
@@ -181,5 +216,6 @@ export const env: Env = {
   ),
   cloudflareTurnKeyId: process.env.CLOUDFLARE_TURN_KEY_ID?.trim() || null,
   cloudflareTurnApiToken: process.env.CLOUDFLARE_TURN_API_TOKEN?.trim() || null,
-  jwtSecret: requiredSecret('JWT_SECRET', process.env.JWT_SECRET),
+  jwtPublicKey,
+  jwtSecret,
 }
